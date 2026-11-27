@@ -1,0 +1,186 @@
+# The project's own. A tag v<graphviz version>.<n> builds dot for every
+# platform and the wasm library from the commit and the pinned sources alone,
+# with no cache, runs each on a runner of its platform, and publishes the
+# archives with their checksums and a build provenance attestation over each.
+# A manual run does everything but publish.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+# One at a time, never cancelled: a release half published is worse than one
+# that waits.
+concurrency:
+  group: ${{ github.workflow }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install hermetic (pinned, verified)
+        uses: ./.github/actions/setup-hermetic
+      - name: The tag names the pinned Graphviz
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: just release-tag "$GITHUB_REF_NAME"
+      - name: The release notes' source section
+        run: mkdir -p .build && just release-notes > .build/notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: notes
+          path: .build/notes.md
+          if-no-files-found: error
+
+  build:
+    needs: plan
+    strategy:
+      matrix:
+        product: [native, wasm]
+    name: build (${{ matrix.product }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install hermetic (pinned, verified)
+        uses: ./.github/actions/setup-hermetic
+      - name: Nothing built or cached before the build
+        run: |
+          tree=$(git status --porcelain --ignored)
+          output=""
+          if [ -d "${LIMEN_BUILD}" ]; then
+            output=$(find "${LIMEN_BUILD}" -mindepth 1 -maxdepth 1)
+          fi
+          if [ -n "${tree}${output}" ]; then
+            echo "::error::a release is built from the commit and the pinned sources alone; found before the build:"
+            printf '%s\n' "${tree}" "${output}"
+            exit 1
+          fi
+      - name: Build the product
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: just product "$PRODUCT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.product }}
+          path: .build/dist/*.tar.gz
+          if-no-files-found: error
+
+  # Each archive's dot, run on a runner of its platform.
+  smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, platform: linux-amd64}
+          - {runner: ubuntu-24.04-arm, platform: linux-arm64}
+          - {runner: macos-15, platform: darwin-arm64}
+          - {runner: windows-2025, platform: windows-amd64}
+          - {runner: windows-11-arm, platform: windows-arm64}
+    name: smoke (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-native
+          path: dist
+      - name: Run the archive's dot
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p unpacked
+          tar -xzf "dist/graphviz-${PLATFORM}.tar.gz" -C unpacked
+          bash native/smoke.sh "unpacked/graphviz-${PLATFORM}"
+
+  # The archive's library, linked into a program and run.
+  smoke-wasm:
+    needs: build
+    name: smoke (wasm32-wasip1)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install hermetic (pinned, verified)
+        uses: ./.github/actions/setup-hermetic
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist-wasm
+          path: dist
+      - name: Link a program against the archive's library and run it
+        run: |
+          mkdir -p unpacked
+          tar -xzf dist/graphviz-wasm32-wasip1.tar.gz -C unpacked
+          just _wasi-sdk
+          bash wasm/smoke.sh unpacked/graphviz-wasm32-wasip1 "$(just _wasi-sdk-dir)"
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, build, smoke, smoke-wasm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      # The release and its assets.
+      contents: write
+      # The attestation's signing identity, and its record.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum -- *.tar.gz > checksums.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/*
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: notes
+          path: notes
+      - name: The corresponding source in the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > notes/current.md
+          if ! grep -q '^## Corresponding source$' notes/current.md; then
+            { cat notes/current.md; echo; cat notes/notes.md; } > notes/full.md
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file notes/full.md
+          fi
