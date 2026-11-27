@@ -1,0 +1,66 @@
+# The upstream sources and the toolchain this repository builds with, pinned by
+# version and digest (limen's book, tooling.md, "Pinned artifacts beyond
+# aqua"). A build reads an entry back with `limen pins get <name>
+# url|sha256`; Renovate proposes the bumps from the renovate: lines and
+# `limen pins refresh` recomputes the digest.
+pins:
+  # Graphviz's release tarball, from the project's own package registry on
+  # GitLab, the one its download page links. It publishes a sha256 beside
+  # the tarball and signs nothing: TLS is the whole guarantee. The tarball
+  # ships the generated parsers, so the build needs no bison or flex.
+  - name: graphviz
+    renovate: gitlab-releases graphviz/graphviz
+    version: 16.1.2
+    url: https://gitlab.com/api/v4/projects/4207231/packages/generic/graphviz-releases/${version}/graphviz-${version}.tar.gz
+    verify: download
+    digest:
+      version: 16.1.2
+      source: 3d8ecc6892ab4a75f995687ffb798339aa59ca3fc861ef046537ddd6b2ae93bd
+      sha256: 4375153fde8bd1ddc09a5ab715cb08c8df8bb35c677cc2ffe67acde808527512
+  # expat, which Graphviz parses HTML-like labels with. The release tarball,
+  # the one libexpat signs, not the tag's archive: Sebastian Pipping, who
+  # publishes the releases, signs them with the key named here.
+  - name: expat
+    renovate: github-tags libexpat/libexpat
+    versioning: regex:^R_(?<major>\d+)_(?<minor>\d+)_(?<patch>\d+)$
+    version: R_2_11_0
+    url: https://github.com/libexpat/libexpat/releases/download/${version}/expat-${major}.${minor}.${patch}.tar.gz
+    verify: pgp-detached https://github.com/libexpat/libexpat/releases/download/${version}/expat-${major}.${minor}.${patch}.tar.gz.asc https://github.com/hartwork.gpg CB8DE70A90CFBF6C3BF5CC5696262ACFFBD3AEC6
+    digest:
+      version: R_2_11_0
+      source: 3f81bbf429d9f2db618f8723658406dccc60ee1b86c53e8bc53e04051cb8bd3e
+      sha256: b3e3fcbb629e4d357a9cc0af5b146b85959bcf1cefe87e529d2c0a9234be737f
+  # wasi-sdk, the clang, wasm-ld and wasi-libc the wasm library is compiled
+  # with, one archive a host that builds it. The project publishes no
+  # signature or checksum beside the release asset: TLS is the whole
+  # guarantee. A program linked against the library uses the same release.
+  - name: wasi-sdk-linux-amd64
+    renovate: github-releases WebAssembly/wasi-sdk
+    extract-version: ^wasi-sdk-(?<version>\d+)$
+    version: 34
+    url: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${version}/wasi-sdk-${version}.0-x86_64-linux.tar.gz
+    verify: download
+    digest:
+      version: 34
+      source: e21d73d04aece0e54c78b68e2d370de247e4bd52ab4c73d049099656e00fe59b
+      sha256: b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4
+  - name: wasi-sdk-linux-arm64
+    renovate: github-releases WebAssembly/wasi-sdk
+    extract-version: ^wasi-sdk-(?<version>\d+)$
+    version: 34
+    url: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${version}/wasi-sdk-${version}.0-arm64-linux.tar.gz
+    verify: download
+    digest:
+      version: 34
+      source: 8cdcf556f9f3e3a1b88977d77d8fcc74ef5eec306c7dd1ddfdf9dd8402bd0310
+      sha256: f7e243dff54d60bcc576e94d6166b69f410f2500ae4a9ceef34315be10e77971
+  - name: wasi-sdk-macos-arm64
+    renovate: github-releases WebAssembly/wasi-sdk
+    extract-version: ^wasi-sdk-(?<version>\d+)$
+    version: 34
+    url: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${version}/wasi-sdk-${version}.0-arm64-macos.tar.gz
+    verify: download
+    digest:
+      version: 34
+      source: 2247654785cc11f720aa4d898064ff9c4d40196e72bacac640677c71bc6e6664
+      sha256: 9c59398106b417f8f14913380fdf0097a8cc0ff4af9eb3ce0065a859e88d49e9

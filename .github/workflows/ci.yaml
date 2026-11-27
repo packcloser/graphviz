@@ -1,0 +1,209 @@
+# Seeded once by `limen fix`, then the project's own but for one line: the
+# `uses:` reference below, which calls the shared lanes (verify on every
+# platform, fuzz, race, tools) in limen-verify.yaml at a commit of
+# farcloser/limen, set by `limen fix` when it writes the file and moved by
+# Renovate with the limen pin (limen itself calls the file locally). This file
+# adds the project's own jobs and gates on all of them.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No default token permissions: each job states what it needs. This workflow
+# only ever reads the repository — it cannot write code, releases, or
+# packages even if a step is compromised.
+permissions: {}
+
+# A superseded run (new push to the same branch/PR) is cancelled, not raced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  limen:
+    uses: farcloser/limen/.github/workflows/limen-verify.yaml@558f7ae692e9df0c5055e9ac2d1d6c66172544f3 # v0.31.0
+    permissions:
+      contents: read
+      # A project that needs another runner set, or whose tests read fixtures
+      # from a git submodule, passes it here, e.g.
+      # with:
+      #   os: '["ubuntu-24.04", "macos-15"]'
+      #   submodules: recursive
+
+  # Each product of `just build` is built in two lanes at once, on two
+  # runners, and the reproducible job holds the two to the same archives: a
+  # build that takes something from the machine or the moment shows there.
+  # The two lanes share a checkout path and the caches, so a path or a cache
+  # reaching a binary would not show; a release builds with no cache.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [native, wasm]
+        lane: [build, rebuild]
+    name: ${{ matrix.lane }} (${{ matrix.product }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install hermetic (pinned, verified)
+        uses: ./.github/actions/setup-hermetic
+      - id: keys
+        name: The caches' keys
+        shell: bash
+        run: |
+          echo "zig=$(zig version)" >> "$GITHUB_OUTPUT"
+          touch "$RUNNER_TEMP/started"
+      # zig's runtime libraries, compiled once a target: kept, a build links
+      # against them instead of compiling them.
+      - id: zig
+        if: matrix.product == 'native'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LIMEN_BUILD }}/zig/global
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.zig }}
+      # The archives pins.yaml names, each verified against its pin on every
+      # run: kept, nothing is downloaded twice.
+      - id: downloads
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LIMEN_BUILD }}/src/*.tar.gz
+          key: project-downloads-${{ runner.os }}-${{ runner.arch }}-${{ matrix.product }}-${{ hashFiles('pins.yaml') }}
+          restore-keys: |
+            project-downloads-${{ runner.os }}-${{ runner.arch }}-${{ matrix.product }}-
+      - name: Build the product
+        shell: bash
+        env:
+          PRODUCT: ${{ matrix.product }}
+        run: just product "$PRODUCT"
+      - name: The archives' checksums
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+          PRODUCT: ${{ matrix.product }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sums"
+          (cd "$LIMEN_BUILD/dist" && sha256sum -- *.tar.gz) | tee "$RUNNER_TEMP/sums/$LANE-$PRODUCT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sums-${{ matrix.lane }}-${{ matrix.product }}
+          path: ${{ runner.temp }}/sums
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.lane }}-${{ matrix.product }}
+          path: ${{ env.LIMEN_BUILD }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+      # Saved on the default branch alone, by one lane: a cache a pull request
+      # saves is restorable by nothing else.
+      - if: matrix.lane == 'build' && matrix.product == 'native' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.zig.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LIMEN_BUILD }}/zig/global
+          key: ${{ steps.zig.outputs.cache-primary-key }}
+      - if: matrix.lane == 'build' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.downloads.outputs.cache-hit != 'true'
+        name: Drop the archives no pin names any more
+        shell: bash
+        run: find "$LIMEN_BUILD/src" -maxdepth 1 -type f ! -newer "$RUNNER_TEMP/started" -print -delete
+      - if: matrix.lane == 'build' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.LIMEN_BUILD }}/src/*.tar.gz
+          key: ${{ steps.downloads.outputs.cache-primary-key }}
+
+  # The wasm library is the same bytes whichever host compiles it: a macOS
+  # runner builds it too, and the reproducible job holds it to linux's.
+  wasm-macos:
+    name: build (wasm, macos)
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install hermetic (pinned, verified)
+        uses: ./.github/actions/setup-hermetic
+      - name: Build the library
+        shell: bash
+        run: just product wasm
+      - name: The archive's checksum
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/sums"
+          (cd "$LIMEN_BUILD/dist" && sha256sum -- *.tar.gz) | tee "$RUNNER_TEMP/sums/macos-wasm"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sums-macos-wasm
+          path: ${{ runner.temp }}/sums
+          if-no-files-found: error
+          retention-days: 1
+
+  reproducible:
+    needs: [build, wasm-macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: sums-*
+          path: sums
+          merge-multiple: true
+      - name: The lanes built the same archives
+        shell: bash
+        run: |
+          export LC_ALL=C
+          cat sums/build-* | sort -k 2 > build
+          cat sums/rebuild-* | sort -k 2 > rebuild
+          if [ ! -s build ]; then
+            echo "::error::no archive to compare: the build lane uploaded no checksum"
+            exit 1
+          fi
+          if ! diff build rebuild; then
+            echo "::error::the two lanes did not build the same archives (<: build, >: rebuild)"
+            exit 1
+          fi
+          if ! diff <(grep wasm32 build) sums/macos-wasm; then
+            echo "::error::linux and macos did not build the same wasm library (<: linux, >: macos)"
+            exit 1
+          fi
+          cat build
+
+  # The ONE required status check (defaultRequiredChecks in
+  # internal/github/audit.go). Requiring the lanes by name would bake the
+  # runner list into every ruleset; this job collapses them to one stable
+  # name. A project job joins `needs` and the assertion below.
+  gate:
+    needs: [limen, build, wasm-macos, reproducible]
+    # always(), and the result asserted explicitly. Without always() a failed
+    # or cancelled dependency SKIPS this job instead of failing it, and a
+    # skipped required check does not block a merge — branch protection that
+    # quietly stops protecting. `needs.limen.result` is success only when
+    # every lane it ran succeeded: each verify leg, fuzz, race and tools.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every lane succeeded
+        env:
+          # Via env, never interpolated into the script: the shell sees data,
+          # not something the expression layer can rewrite into code.
+          LIMEN: ${{ needs.limen.result }}
+          BUILD: ${{ needs.build.result }}
+          WASM_MACOS: ${{ needs.wasm-macos.result }}
+          REPRODUCIBLE: ${{ needs.reproducible.result }}
+        shell: bash
+        run: |
+          printf 'limen: %s\nbuild: %s\nwasm-macos: %s\nreproducible: %s\n' "$LIMEN" "$BUILD" "$WASM_MACOS" "$REPRODUCIBLE"
+          [ "$LIMEN" = "success" ] && [ "$BUILD" = "success" ] && [ "$WASM_MACOS" = "success" ] && [ "$REPRODUCIBLE" = "success" ]
